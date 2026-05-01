@@ -1,0 +1,26 @@
+name: Correction
+description: Report a factual error, typo, or missing prior art.
+title: "Correction: "
+labels: ["correction"]
+body:
+  - type: textarea
+    id: correction
+    attributes:
+      label: What should be corrected?
+      description: Describe the factual error, typo, or missing prior art.
+    validations:
+      required: true
+  - type: textarea
+    id: suggested-fix
+    attributes:
+      label: Suggested fix
+      description: Optional replacement text or edit.
+    validations:
+      required: false
+  - type: textarea
+    id: source-or-reference
+    attributes:
+      label: Source or reference
+      description: Optional source that supports the correction.
+    validations:
+      required: false

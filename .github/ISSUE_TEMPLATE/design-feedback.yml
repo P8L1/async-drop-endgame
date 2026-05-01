@@ -1,0 +1,43 @@
+name: Design feedback
+description: Specific feedback on the async-drop endgame design.
+title: "Design feedback: "
+labels: ["design-feedback"]
+body:
+  - type: textarea
+    id: relevant-section
+    attributes:
+      label: Relevant section
+      description: Which document and section does this feedback apply to?
+    validations:
+      required: true
+  - type: textarea
+    id: concern-or-suggestion
+    attributes:
+      label: Concern or suggestion
+      description: Describe the issue, risk, or proposed improvement.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example
+      description: Optional Rust example that illustrates the feedback.
+      render: rust
+    validations:
+      required: false
+  - type: textarea
+    id: possible-alternative
+    attributes:
+      label: Possible alternative
+      description: Optional alternative design, wording, or migration path.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I checked whether this is already listed in open-questions.md.
+          required: true
+        - label: This issue is specific enough to discuss separately.
+          required: true
