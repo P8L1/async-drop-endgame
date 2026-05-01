@@ -6,12 +6,7 @@ This is a design note, not an RFC.
 
 It describes one possible end-state for Rust async destruction. The goal is to make the tradeoffs discussable, not to claim that the design is settled.
 
-This note builds on existing Rust async-drop work, especially:
-
-- the Rust async-drop tracking issue: <https://github.com/rust-lang/rust/issues/126482>
-- the async-drop roadmap: <https://rust-lang.github.io/async-fundamentals-initiative/roadmap/async_drop.html>
-- the zetanumbers async-drop design: <https://zetanumbers.github.io/book/async-drop-design.html>
-- pin ergonomics work: <https://rust-lang.github.io/rust-project-goals/2025h2/pin-ergonomics.html>
+This note builds on existing Rust async-drop work, especially the tracking, roadmap, design, and pin-ergonomics work summarized in [prior-art.md](prior-art.md).
 
 The main contribution of this note is not the existence of `AsyncDrop` itself. The contribution is a stricter end-state model for:
 

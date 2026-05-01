@@ -1,4 +1,3 @@
-
 # Open Questions
 
 ## 1. Synchronously undroppable types

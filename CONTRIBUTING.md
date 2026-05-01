@@ -1,4 +1,3 @@
-
 # Contributing
 
 This repository is for focused technical discussion of a possible Rust async-drop endgame design. It is a design note, not an RFC, so contributions should improve clarity, identify risks, or make the tradeoffs easier to evaluate.

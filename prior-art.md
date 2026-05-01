@@ -1,4 +1,3 @@
-
 # Prior Art
 
 This repository builds on existing Rust async-drop directions. The links below are the intentionally limited reference set for this note.

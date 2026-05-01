@@ -6,6 +6,7 @@ The proposal builds on existing Rust async-drop work and focuses on:
 
 - synchronously undroppable types and a possible `!Destruct` capability boundary
 - cancellation behavior for implicit async-drop await points
+- generated futures that may themselves need async destruction
 - interaction between `Drop` and `AsyncDrop`
 - async destruction of `dyn Trait` values without mandatory extra allocation
 - a staged migration path from today's explicit cleanup patterns
@@ -48,4 +49,3 @@ Use GitHub issues for focused corrections or design feedback. Use GitHub Discuss
 This repository is dual licensed under either Apache-2.0 or MIT, at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this repository is licensed as MIT OR Apache-2.0, without additional terms or conditions.
-A design note exploring a type-system endgame for Rust async drop, !Destruct, cancellation-shielded cleanup, and dyn async destruction.
