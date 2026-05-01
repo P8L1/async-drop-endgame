@@ -1,146 +1,207 @@
-
 # Async Drop Endgame: First-Class Destructibility and Cancellation-Shielded Cleanup
 
-## 1. Status
+## 1. Status and intent
 
-This is a design note, not an RFC. It is intended to explore one possible end-state for Rust async drop in enough detail to make tradeoffs discussable.
+This is a design note, not an RFC.
 
-The note builds on existing Rust async-drop work. It does not try to replace that work or claim that the design here is settled.
+It describes one possible end-state for Rust async destruction. The goal is to make the tradeoffs discussable, not to claim that the design is settled.
 
-## 2. Summary
+This note builds on existing Rust async-drop work, especially:
+
+- the Rust async-drop tracking issue: <https://github.com/rust-lang/rust/issues/126482>
+- the async-drop roadmap: <https://rust-lang.github.io/async-fundamentals-initiative/roadmap/async_drop.html>
+- the zetanumbers async-drop design: <https://zetanumbers.github.io/book/async-drop-design.html>
+- pin ergonomics work: <https://rust-lang.github.io/rust-project-goals/2025h2/pin-ergonomics.html>
+
+The main contribution of this note is not the existence of `AsyncDrop` itself. The contribution is a stricter end-state model for:
+
+- synchronously undroppable types;
+- futures that contain synchronously undroppable state;
+- cancellation-shielded implicit cleanup;
+- `Drop` and `AsyncDrop` interaction;
+- `dyn Trait` async destruction without mandatory extra allocation;
+- incremental adoption.
+
+## 2. Executive summary
 
 Rust should treat async destruction as a compiler-known sibling of normal destruction.
 
-The core pieces are:
+The end-state should have these pieces:
 
-1. compiler-generated async drop glue for all types
-2. a user-facing `AsyncDrop` trait for custom async cleanup
-3. type-system support for synchronously undroppable types
-4. cancellation-shielded implicit async-drop await points
-5. dynamic dispatch support without mandatory extra heap allocation
+1. compiler-generated async drop glue for all types;
+2. a user-facing `AsyncDrop` trait for custom async cleanup;
+3. a type-system distinction between synchronously destructible and async-only destructible values;
+4. generated futures that become synchronously undroppable when they contain async-only destruction obligations across suspension points;
+5. cancellation-shielded implicit async-drop await points;
+6. dynamic dispatch support without mandatory extra heap allocation;
+7. diagnostics that explain where async destruction is required and where synchronous destruction is impossible;
+8. a migration path that gives libraries useful async cleanup before introducing async-only destruction.
 
-The intended model is direct: synchronous code requires synchronous destruction, while async code can perform async destruction. Some types may eventually be expressible as async-only destructible.
+The intended mental model is:
 
-## 3. Motivation
-
-Today, async cleanup is often represented by explicit `.close().await`, `.flush().await`, `.shutdown().await`, or `.rollback().await` methods. That pattern is workable, but fragile. It depends on every caller remembering to call the method on every control-flow path, including early returns and error paths.
-
-Examples include:
-
-- async I/O flush before a writer is discarded
-- network shutdown that sends protocol-level close frames
-- distributed lock release that must contact a coordinator
-- transaction rollback or commit
-- protocol close handshakes where dropping a handle silently is not equivalent to closing it
-
-Rust already makes synchronous cleanup reliable by tying it to ownership and scope exit. Async cleanup needs a similarly principled place in the language if some resources cannot be safely cleaned up by synchronous `Drop` alone.
-
-## 4. Design goals
-
-- Soundness: required cleanup should not depend only on convention.
-- Explicit costs: async destruction introduces await points and should be visible in type and control-flow reasoning.
-- No mandatory hidden heap allocation: compiler-generated async destruction for statically known types should not require boxing.
-- Predictable destruction order: async destruction should preserve ordinary Rust destruction-order rules.
-- Compatibility with `Pin`: pinned values need a destruction path that does not move them.
-- Clear interaction with `Send` and auto traits: async destructor futures affect the futures that may run them.
-- Incremental migration: synchronously droppable types should be able to adopt async cleanup before async-only destruction is introduced.
-- Useful diagnostics: users should get direct explanations when a value cannot be dropped in the current context.
-
-## 5. Core model
-
-Normal Rust has synchronous drop glue. For a type `T`, the compiler knows how to destroy `T`: run user `Drop` if present, then destroy fields in the correct order.
-
-Async Rust should have async drop glue. For a type `T`, the compiler should be able to construct an async destruction operation: run user async cleanup if present, otherwise run synchronous cleanup when applicable, then recursively async-destroy fields.
-
-Conceptually, the compiler might reason in terms of an internal trait like:
-
-```rust
-trait AsyncDestruct {
-    type AsyncDestructor: Future<Output = ()>;
-}
+```text
+synchronous code requires synchronous destruction;
+async code may perform async destruction;
+async-only values cannot be silently dropped synchronously;
+futures that may need async cleanup during cancellation are themselves not synchronously droppable;
+implicit async cleanup is cancellation-shielded;
+explicit async cleanup follows normal async cancellation rules.
 ```
 
-This sketch is not proposed surface syntax. It is a way to describe the compiler-known relationship between a type and its async destructor future.
+## 3. Design invariants
 
-## 6. Async destruction algorithm
+A good async-drop design should preserve these invariants.
 
-In an async context, destroying a value of type `T` should behave conceptually as follows:
+### 3.1 No silent wrong cleanup
 
-1. If `T` implements `AsyncDrop`, run it.
-2. Else if `T` implements `Drop`, run normal `Drop`.
-3. Then recursively async-destroy fields.
-4. Preserve ordinary Rust destruction-order rules.
+If a type semantically requires async cleanup, the language should not silently fall back to synchronous destruction.
 
-This keeps async destruction recognizable as Rust destruction. The async version extends the cleanup operation with awaitable steps; it should not invent a surprising new ordering model.
+A warning may be useful during migration, but the final model should make incorrect synchronous destruction a type error.
 
-## 7. Destructibility as a type-system property
+### 3.2 No mandatory allocation for statically known types
 
-The type system may need to distinguish among several properties:
+For a concrete `T`, async destruction should lower to compiler-generated state machines. It should not require boxing solely because the destruction is async.
 
-- can be dropped synchronously
-- can be dropped asynchronously
-- cannot be safely dropped synchronously
+### 3.3 Dynamic dispatch may pay dynamic-dispatch costs, not mandatory extra allocation
 
-A possible spelling could look like this:
+`dyn Trait` support may require a vtable call, erased state, or representation-specific storage. It should not require boxing every async destructor future as the semantic model.
+
+### 3.4 Normal Rust destruction order remains the default
+
+Async destruction should preserve ordinary Rust destruction-order rules unless an explicit design exception is accepted.
+
+### 3.5 Implicit cleanup is not ordinary user work
+
+An implicit async destructor is part of ownership cleanup. It should not be cancellable in the same way as an ordinary `.await` inside user code.
+
+### 3.6 No global runtime requirement
+
+The language should not require a global executor or runtime to make async drop work.
+
+### 3.7 The type system must reflect cancellation reality
+
+A future can be dropped before completion. If that future may contain async-only destructible state, synchronous cancellation cannot be valid. Therefore the generated future must itself be treated as synchronously undroppable unless the compiler can prove no async-only state remains across cancellation points.
+
+This invariant is central. Without it, `!Destruct` is unsound in practice.
+
+## 4. Terminology
+
+This note uses the following terms.
+
+### Synchronous destruction
+
+The ordinary destruction path available from synchronous Rust. It can run `Drop` and destroy fields without awaiting.
+
+### Async destruction
+
+An awaitable destruction path generated by the compiler. It can run `AsyncDrop`, run synchronous `Drop` where appropriate, and recursively async-destroy fields.
+
+### Synchronously destructible
+
+A value is synchronously destructible if it can be safely destroyed without awaiting.
+
+Sketch:
 
 ```rust
 trait Destruct {}
+```
+
+The exact spelling is not proposed here.
+
+### Async-only destructible
+
+A value is async-only destructible if it requires async destruction and cannot be safely destroyed synchronously.
+
+Sketch:
+
+```rust
 impl !Destruct for Connection {}
 ```
 
-The exact syntax is open. The important property is semantic: if a type requires async cleanup for sound or specified behavior, accidentally allowing it to fall back to synchronous destruction should be a type-system error, not merely a best-effort warning.
+Again, the exact syntax is open.
 
-## 8. Context rules
+### Implicit async drop
 
-Sync contexts require sync destructibility. If a function may need to destroy a value without awaiting, the value must be synchronously destructible.
+Async destruction inserted by the compiler at scope exit, early return, error return, temporary cleanup, or generated future cancellation cleanup.
 
-Async contexts can own values that are not synchronously destructible, because scope exit can run async destruction.
+### Explicit async cleanup
 
-For example:
-
-```rust
-fn sync_consume<T: Destruct>(value: T) {}
-
-async fn async_consume<T: ?Destruct>(value: T) {}
-```
-
-This syntax is only a sketch. The core rule is that async-only destructible values must not escape into contexts where the compiler cannot run their async destructor.
-
-## 9. Why lints are not enough
-
-A lint is useful for migration. It can identify types that probably should be explicitly closed, warn when an async cleanup method is ignored, or prepare users for a future stronger model.
-
-As a final model, a lint is not enough. If async cleanup is required, sync drop should be a type error. Otherwise the language still permits the very bug the design is meant to prevent.
-
-## 10. Cancellation behavior
-
-Implicit async drop creates hidden await points. If those await points are cancellable in the ordinary way, cleanup can be interrupted after the program has already committed to destroying the value. That would make implicit cleanup much less reliable than synchronous drop.
-
-The default should be that implicit async-drop await points are cancellation-shielded. Once destruction starts, the compiler-generated cleanup path should be driven to completion unless the process aborts or an equivalent unrecoverable condition occurs.
-
-Explicit async cleanup remains normally cancellable:
+User-written cleanup such as:
 
 ```rust
 resource.close().await;
 ```
 
-Calling an explicit method is ordinary async control flow. Implicit destruction is different because it is part of ownership cleanup.
-
-## 11. `Drop` and `AsyncDrop`
-
-There are at least three useful strategies.
-
-Synchronous only:
+or a possible explicit standard operation such as:
 
 ```rust
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
+async_drop(resource).await;
+```
+
+Explicit cleanup is ordinary async control flow. Implicit async drop is ownership cleanup.
+
+## 5. Motivation
+
+Today, async cleanup is often represented by explicit methods:
+
+```rust
+connection.close().await?;
+writer.flush().await?;
+transaction.rollback().await?;
+```
+
+That pattern is workable, but fragile. It depends on every caller remembering to call the method on every path.
+
+Failure modes include:
+
+- early return before cleanup;
+- `?` returning before cleanup;
+- panic paths;
+- task cancellation;
+- forgotten `close().await`;
+- abandoned futures;
+- cleanup methods that are easy to ignore because they are not part of ownership;
+- trait objects that erase the concrete cleanup future type;
+- generic code that assumes all owned values can be dropped synchronously.
+
+Examples where async cleanup matters:
+
+- flushing buffered async I/O;
+- sending network close frames;
+- releasing distributed locks;
+- rolling back or committing transactions;
+- releasing remote leases;
+- finishing protocol-level shutdown;
+- telling a remote coordinator that a resource is no longer owned.
+
+Rust already makes synchronous cleanup reliable by tying cleanup to ownership and scope exit. Async Rust needs a similarly principled model for resources whose correct cleanup requires `.await`.
+
+## 6. Non-goals
+
+This proposal does not aim to:
+
+- make all Rust destruction async;
+- require a global executor;
+- require every runtime to support async-only futures immediately;
+- hide ordinary user `.await` points;
+- remove ordinary `Drop`;
+- require allocation for async destructors;
+- stabilize every piece at once;
+- claim final syntax for `Destruct`, `!Destruct`, or `?Destruct`.
+
+## 7. Surface model sketch
+
+A possible user-facing trait could be:
+
+```rust
+trait AsyncDrop {
+    async fn drop(self: Pin<&mut Self>);
 }
 ```
 
-Synchronous fallback plus better async cleanup:
+The pinned receiver matters because the destructor may suspend while the value is still alive.
+
+A type with a best-effort synchronous fallback could implement both `Drop` and `AsyncDrop`:
 
 ```rust
 impl Drop for BufferedWriter {
@@ -156,7 +217,7 @@ impl AsyncDrop for BufferedWriter {
 }
 ```
 
-Async-only cleanup:
+A type that cannot be correctly cleaned up synchronously could opt out of synchronous destruction:
 
 ```rust
 impl !Destruct for Connection {}
@@ -168,22 +229,306 @@ impl AsyncDrop for Connection {
 }
 ```
 
-The second strategy is important for migration. Existing types can keep a conservative synchronous fallback while offering better async cleanup in async contexts.
+This is only a syntax sketch. The important rule is semantic: async-only destructible values must not be silently synchronously dropped.
 
-## 12. Dynamic dispatch
+## 8. Compiler model
 
-`dyn Trait` is hard because the concrete destructor future type is erased. For statically known `T`, the compiler can produce a concrete async destructor future. For a trait object, the destructor future depends on the erased concrete type.
+Normal Rust has synchronous drop glue. For a type `T`, the compiler knows how to destroy `T` synchronously: run user `Drop` if present, then destroy fields in the correct order.
 
-Mandatory boxing should not be the default design target. Boxing every dynamic async destructor would make dynamic dispatch work, but it would impose allocation even when a chosen dynamic representation could avoid it.
+Async Rust should have async drop glue. For a type `T`, the compiler should know how to construct an async destruction operation: run user async cleanup if present, otherwise run synchronous cleanup when applicable, then recursively async-destroy fields.
 
-The target property should be:
+Conceptually, the compiler may reason in terms of an internal trait like:
 
-- static async destruction has no allocation
-- dynamic async destruction has no mandatory extra allocation beyond the chosen dynamic representation
+```rust
+trait AsyncDestruct {
+    type AsyncDestructor: Future<Output = ()>;
+}
+```
 
-This may require vtable support, in-place erased future storage, placement-style protocols, or other compiler/runtime representation work. The key point is that allocation should be a representation choice, not the required semantic model.
+This is not proposed surface syntax. It describes the compiler-known relationship between a type and its generated async destructor future.
 
-## 13. Pinning
+The internal property should be universal: every type has an async destruction path. For ordinary types, async destruction may be equivalent to synchronous destruction and contain no real await points.
+
+## 9. Async destruction algorithm
+
+In an async destruction context, destroying a value of type `T` should conceptually behave as follows:
+
+1. If `T` implements `AsyncDrop`, run it.
+2. Else if `T` implements `Drop`, run ordinary `Drop`.
+3. Then recursively async-destroy fields in ordinary Rust destruction order.
+4. Maintain drop flags and partial-initialization semantics as normal Rust destruction does.
+
+This algorithm keeps async destruction recognizable as Rust destruction. It extends the cleanup operation with awaitable steps; it should not invent a surprising new ordering model.
+
+### 9.1 `Drop` plus `AsyncDrop`
+
+A type should be allowed to implement both when the synchronous path is a valid fallback and the async path is better.
+
+This is important for migration. Many existing libraries can add async cleanup without becoming async-only destructible immediately.
+
+### 9.2 Async-only fields
+
+If a struct contains async-only destructible fields, then the struct is not synchronously destructible by default.
+
+Sketch:
+
+```rust
+struct Session {
+    connection: Connection, // !Destruct
+}
+```
+
+`Session: Destruct` should not hold automatically. A synchronous context cannot safely destroy `Session` because it cannot safely destroy `connection`.
+
+Escape hatches such as `ManuallyDrop`, `mem::forget`, or unsafe raw-pointer operations require their own rules, just as they do for ordinary destruction.
+
+## 10. Destructibility as a type-system property
+
+The type system should distinguish:
+
+```text
+can be dropped synchronously;
+can be dropped asynchronously;
+cannot be safely dropped synchronously.
+```
+
+A possible model:
+
+```rust
+trait Destruct {}
+```
+
+`T: Destruct` means `T` can be destroyed without awaiting.
+
+`T: ?Destruct` means the code is generic over whether `T` is synchronously destructible.
+
+`impl !Destruct for T` means `T` cannot be synchronously destroyed.
+
+The exact spelling is open. It could be a lang item, an auto trait, a negative impl, a special bound, or something else.
+
+The core requirement is not the syntax. The core requirement is that synchronous destruction obligations must be checked statically.
+
+## 11. Context rules
+
+### 11.1 Synchronous contexts
+
+A synchronous context can only own values it may need to destroy synchronously.
+
+Sketch:
+
+```rust
+fn sync_consume<T: Destruct>(value: T) {
+    drop(value);
+}
+```
+
+A synchronous function that may drop `T` needs `T: Destruct`.
+
+This should be the default for backwards compatibility. Existing sync generic code should continue to mean that values can be synchronously destroyed.
+
+### 11.2 Async contexts
+
+An async context can own values that require async destruction, but this has consequences for the generated future.
+
+Sketch:
+
+```rust
+async fn async_consume<T: ?Destruct>(value: T) {
+    use_value(value).await;
+}
+```
+
+This is only valid if the generated future has an appropriate destruction story.
+
+## 12. The central future-cancellation rule
+
+Async functions return futures. Futures can be dropped before completion.
+
+This creates the most important rule in the design:
+
+```text
+If a generated future may contain async-only destructible state across a suspension or cancellation point, then that future is itself not synchronously destructible.
+```
+
+Example:
+
+```rust
+async fn run() {
+    let conn = Connection::open().await; // Connection: !Destruct
+    do_work().await;
+} // conn requires async destruction
+```
+
+The generated future for `run()` may contain `conn` while suspended at `do_work().await`. If the future is cancelled by ordinary synchronous drop, `conn` cannot be cleaned up correctly.
+
+Therefore the generated future must be treated as async-only destructible unless the compiler can prove that no async-only destruction obligation can exist when the future is synchronously dropped.
+
+This has direct consequences:
+
+```rust
+let fut = run();
+drop(fut); // should be rejected if the future is !Destruct
+```
+
+and for executor APIs:
+
+```rust
+fn spawn<F>(future: F)
+where
+    F: Future + Send + 'static + Destruct,
+{
+    // current-style executor may synchronously cancel by dropping F
+}
+```
+
+An executor that wants to accept async-only futures needs an async cancellation/destruction path:
+
+```rust
+fn spawn_async_destructible<F>(future: F)
+where
+    F: Future + Send + 'static,
+    F: ?Destruct,
+{
+    // runtime must drive async destruction on cancellation/shutdown
+}
+```
+
+The exact API is not proposed here. The important property is that the type system must not let async-only state be hidden inside a future that can be synchronously dropped.
+
+Without this rule, `!Destruct` would be mostly cosmetic.
+
+## 13. Cancellation behavior
+
+Implicit async drop creates hidden await points.
+
+Example:
+
+```rust
+async fn run(conn: Connection) {
+    conn.write().await;
+} // implicit async drop may happen here
+```
+
+If this implicit cleanup can be cancelled in the ordinary way, the resource may be left partially cleaned up after the program has already committed to destroying it.
+
+The proposed rule is:
+
+```text
+Implicit async-drop await points are cancellation-shielded by default.
+```
+
+Meaning: once compiler-generated async destruction starts, the async destruction path should be driven to completion unless the process aborts, panics according to defined panic rules, or reaches an explicitly specified safe interruption point.
+
+This rule applies to compiler-inserted ownership cleanup, not to all user `.await` points.
+
+Explicit async cleanup remains ordinary async control flow:
+
+```rust
+resource.close().await;
+```
+
+or:
+
+```rust
+async_drop(resource).await;
+```
+
+Such explicit awaits should follow the usual cancellation semantics unless the explicit API chooses to provide its own shielding.
+
+## 14. Panic behavior
+
+Async drop must specify panic behavior.
+
+A conservative rule would mirror ordinary destruction as much as possible:
+
+- a panic inside `AsyncDrop` is a panic from destruction;
+- already-destroyed fields remain destroyed;
+- drop flags preserve partial-destruction state;
+- a second panic during cleanup follows Rust's existing double-panic behavior or an explicitly specified async-drop analogue;
+- async-only cleanup is not allowed to be silently skipped merely because a panic path is being unwound.
+
+This section needs deeper design work. The key point is that panic paths are part of the reason async cleanup should be compiler-owned rather than a convention.
+
+## 15. `Drop` and `AsyncDrop` strategies
+
+There are at least three useful categories.
+
+### 15.1 Synchronous only
+
+```rust
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+```
+
+This remains ordinary Rust.
+
+### 15.2 Synchronous fallback plus better async cleanup
+
+```rust
+impl Drop for BufferedWriter {
+    fn drop(&mut self) {
+        self.mark_unflushed_for_recovery();
+    }
+}
+
+impl AsyncDrop for BufferedWriter {
+    async fn drop(self: Pin<&mut Self>) {
+        self.flush().await;
+    }
+}
+```
+
+This type remains synchronously destructible. Async contexts get better cleanup.
+
+### 15.3 Async-only cleanup
+
+```rust
+impl !Destruct for Connection {}
+
+impl AsyncDrop for Connection {
+    async fn drop(self: Pin<&mut Self>) {
+        self.shutdown().await;
+    }
+}
+```
+
+This type cannot be owned by code that may need to destroy it synchronously.
+
+## 16. Dynamic dispatch
+
+`dyn Trait` is hard because the concrete async destructor future type is erased.
+
+For concrete `T`, the compiler knows the destructor state machine. For `dyn Trait`, the destructor state depends on the erased concrete type.
+
+The easy answer is mandatory boxing:
+
+```text
+async destructor for dyn object = Box<dyn Future<Output = ()>>
+```
+
+That should not be the semantic model.
+
+The design target should be:
+
+```text
+static async destruction: no allocation;
+dynamic async destruction: no mandatory extra allocation beyond the chosen dynamic representation.
+```
+
+Possible implementation directions include:
+
+- vtable entries for async destruction polling;
+- wrapper storage created before type erasure;
+- placement-style protocols that let the destructor future be initialized into caller-provided storage;
+- erased poll-drop shims;
+- representation-specific allocation only when the chosen container already allocates.
+
+The important constraint is that allocation should be a representation choice, not the definition of async destruction.
+
+## 17. Pinning and projection
 
 `AsyncDrop` likely needs a pinned receiver:
 
@@ -193,38 +538,214 @@ trait AsyncDrop {
 }
 ```
 
-That shape allows async cleanup for pinned resources without moving the value. It also aligns with the fact that async destructor futures may hold references into the value while cleanup is in progress.
+The destructor may suspend while holding references into the value. Moving the value during that process would be unsound.
 
-## 14. Auto traits and `Send`
+This means async drop depends on the broader pin-ergonomics story. A minimal design can use `Pin<&mut Self>` and projection helpers. A better long-term design should integrate with pinned references, pin-aware field projection, and pin-aware drop ergonomics.
 
-If an async function owns `T`, the returned future may need to async-drop `T`. That means the outer future's `Send` status can depend on the async destructor future for `T`.
+Async drop should not make ordinary users manually fight `Pin` unless they are implementing low-level async resources.
 
-This follows the same broad principle as ordinary async lowering: values held across await points affect the generated future. If destruction introduces await points, the destructor future must be included in auto-trait reasoning.
+## 18. Auto traits and `Send`
 
-## 15. Migration strategy
+If an async function owns `T`, the returned future may need to async-drop `T`.
 
-Stage 1: compiler machinery. Teach the compiler to model async destruction internally and generate async drop glue where needed.
+Therefore the generated future's auto traits may depend on the async destructor future for `T`.
 
-Stage 2: stable async cleanup for synchronously droppable types. Let libraries provide better cleanup in async contexts while retaining existing synchronous behavior.
+For example:
 
-Stage 3: diagnostics and lints. Warn on fragile explicit cleanup patterns, ignored cleanup futures, and types that appear to want async-only destruction.
+```rust
+async fn run<T>(value: T) {
+    work().await;
+}
+```
 
-Stage 4: opt-in async-only destruction. Allow selected types to declare that synchronous destruction is not available.
+If `value` may be stored across an await and later async-dropped, then the outer future's `Send` status may depend on whether the async destructor for `T` is `Send`.
 
-Stage 5: future edition improvements. Consider stronger defaults, clearer bounds, or syntax improvements once experience accumulates.
+The final design must integrate async destruction with auto-trait analysis. This cannot be left entirely to libraries.
 
-## 16. Open questions
+## 19. Diagnostics
 
-See [open-questions.md](open-questions.md).
+This feature needs excellent diagnostics.
 
-## 17. Conclusion
+Examples of desired diagnostics:
 
-The proposed end-state is:
+```text
+error: `Connection` cannot be dropped synchronously
+note: `Connection` implements async-only destruction
+help: move this value into an async context that can run async drop
+help: call an explicit async close method before leaving this scope
+```
 
-- synchronous code requires synchronous destruction
-- async code can perform async destruction
-- some types may be async-only destructible
-- implicit async cleanup should be reliable and cancellation-shielded
-- dynamic async destruction should avoid mandatory extra allocation
+```text
+error: future returned by `run` cannot be dropped synchronously
+note: it may contain `Connection`, which requires async destruction
+help: use an executor API that supports async cancellation/destruction
+```
 
-This model tries to make async cleanup part of Rust's ownership story while keeping the design incremental and honest about unresolved questions.
+```text
+warning: `BufferedWriter` has async cleanup but is being dropped synchronously
+note: synchronous drop will use the fallback cleanup path
+help: call `flush().await` or allow async drop to run in an async context
+```
+
+Good diagnostics are part of the design, not a polish detail. Without them, `!Destruct` will feel like a mysterious infectious bound.
+
+## 20. Escape hatches
+
+Rust needs explicit escape hatches.
+
+Possible rules:
+
+- `mem::forget(value)` remains possible and intentionally leaks the value;
+- `ManuallyDrop<T>` suppresses automatic destruction and transfers responsibility to the programmer;
+- unsafe raw-pointer destruction APIs must distinguish synchronous and asynchronous destruction;
+- synchronous `drop_in_place` requires `T: Destruct`;
+- async `async_drop_in_place` requires an async context and must respect pinning.
+
+Sketch:
+
+```rust
+unsafe fn drop_in_place<T: Destruct>(ptr: *mut T);
+
+async unsafe fn async_drop_in_place<T: ?Destruct>(ptr: Pin<*mut T>);
+```
+
+The exact API is open. The key point is that unsafe code must be able to state which destruction path it is invoking.
+
+## 21. Runtime and executor implications
+
+This design does not require a global runtime, but it does affect executor APIs.
+
+Current executors often assume cancellation means synchronously dropping a future. That works for synchronously destructible futures.
+
+For async-only futures, cancellation must become an async operation. A runtime may choose not to support such futures initially.
+
+This suggests two classes of executor APIs:
+
+```text
+current-style spawn: accepts futures that can be synchronously cancelled;
+async-destruction-aware spawn: accepts futures that may require async cancellation cleanup.
+```
+
+The language should not force all runtimes to support async-only futures on day one. But it should give runtimes a sound path to support them.
+
+## 22. Migration strategy
+
+A realistic path should be staged.
+
+### Stage 1: compiler machinery
+
+Implement async drop glue, internal async destruction, and automatic async destruction in async contexts behind a feature gate.
+
+### Stage 2: stable async cleanup for synchronously droppable types
+
+Stabilize `AsyncDrop` for types that remain synchronously destructible.
+
+This gives immediate value:
+
+- better cleanup in async contexts;
+- no breaking change to generic sync code;
+- no need for executors to support async-only futures immediately.
+
+### Stage 3: diagnostics and lints
+
+Warn on fragile patterns:
+
+- ignored cleanup futures;
+- types with async cleanup being synchronously dropped;
+- futures that may become async-only destructible;
+- suspicious `Drop` implementations for types that also implement `AsyncDrop`.
+
+### Stage 4: opt-in async-only destruction
+
+Introduce a way for selected types to declare that synchronous destruction is unavailable.
+
+This should be opt-in and conservative.
+
+### Stage 5: async-destruction-aware futures and executors
+
+Allow generated futures to become synchronously undroppable when they may contain async-only state across suspension points.
+
+Provide enough language/library support for executors to drive async cancellation/destruction.
+
+### Stage 6: future edition improvements
+
+A future edition could consider stronger defaults, such as async contexts being more naturally generic over `?Destruct`, while synchronous contexts continue to require synchronous destructibility.
+
+## 23. Minimal viable stabilization
+
+The smallest useful stable feature is probably not the full model.
+
+A plausible first stabilization could include:
+
+- `AsyncDrop` for types that are still synchronously destructible;
+- compiler-generated async drop glue in async contexts;
+- no async-only destructible types yet;
+- no requirement that runtimes support async-only futures yet;
+- diagnostics warning when synchronous fallback cleanup is used instead of async cleanup.
+
+This would be useful and low-risk, but it should be designed so it does not block the later `!Destruct` end-state.
+
+## 24. Open questions
+
+Important open questions include:
+
+1. What is the exact syntax for synchronously undroppable types?
+2. Is `Destruct` a trait, auto trait, lang item, negative impl, or special bound?
+3. How precisely should cancellation shielding be specified?
+4. Can cancellation shielding be implemented without surprising executor authors?
+5. What is the exact API for async cancellation/destruction of futures?
+6. How should panic during async drop interact with unwinding and double panic?
+7. Should implementing both `Drop` and `AsyncDrop` be unrestricted, linted, or constrained?
+8. What is the best `dyn Trait` representation?
+9. How should async destruction affect `Send`, `Sync`, and other auto traits?
+10. What migration path avoids ecosystem breakage while still reaching the correct end-state?
+11. How should unsafe code express sync vs async destruction obligations?
+12. How should async drop interact with pin projection and pinned fields?
+
+See also [open-questions.md](open-questions.md).
+
+## 25. Why this is better than a minimal `AsyncDrop` trait
+
+A minimal `AsyncDrop` trait solves only part of the problem.
+
+It lets types define async cleanup, but without a full destructibility model it leaves hard questions unanswered:
+
+- what happens in synchronous code;
+- what happens when a future containing async-only state is cancelled;
+- whether implicit cleanup can be half-cancelled;
+- whether `dyn Trait` forces allocation;
+- how `Send` is computed;
+- how unsafe code chooses the correct destruction path.
+
+The stronger model in this note is more complicated, but it better matches Rust's goals.
+
+It makes the important facts statically visible:
+
+```text
+this value can be dropped synchronously;
+this value requires async destruction;
+this future cannot be synchronously cancelled;
+this executor API only accepts synchronously cancellable futures.
+```
+
+That is the Rust-shaped answer.
+
+## 26. Conclusion
+
+Async drop should not be treated as merely "allow `.await` inside `Drop`."
+
+The better end-state is first-class destructibility:
+
+```text
+synchronous code requires synchronous destruction;
+async code can perform async destruction;
+some values may be async-only destructible;
+futures containing async-only state may themselves be async-only destructible;
+implicit async cleanup should be reliable and cancellation-shielded;
+dynamic async destruction should avoid mandatory extra allocation;
+unsafe code and executor APIs should state which destruction path they support.
+```
+
+This model is harder than a minimal `AsyncDrop` trait. It requires compiler work, type-system work, runtime API design, and careful migration.
+
+But it has the right shape for Rust: cleanup remains tied to ownership, costs remain explicit, unsound synchronous cleanup becomes a type error, allocation is not forced by default, and async resources can eventually get RAII-quality cleanup.
