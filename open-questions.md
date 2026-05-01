@@ -46,28 +46,41 @@
 - Can diagnostics point directly to the destructor that affects auto-trait inference?
 - Are additional marker traits needed for cancellation shielding or async destructibility?
 
-## 7. Pin projection
+## 7. Generated futures and async cancellation
+
+- If an async function holds an async-only destructible value across an `.await`, does the generated future itself become synchronously undroppable?
+- Should futures that may require async destruction be prevented from being dropped by ordinary synchronous `drop`?
+- Does task cancellation need an async cancellation path that can drive compiler-generated async destruction to completion?
+- How should executors represent a task that has been cancelled but still needs to run cancellation-shielded async destructors?
+- Can existing executor APIs support async destruction of tasks without a breaking change, or is a new trait/API required?
+- Should `JoinHandle::abort`-style operations be allowed to skip async destruction, or must they enter an async cleanup state?
+- How should this model distinguish ordinary future cancellation from async destruction after cancellation?
+- What diagnostics are needed when a future cannot be synchronously dropped because it contains async-only destructible state?
+- Can futures remain synchronously droppable when all async destructors they may run have safe synchronous fallbacks?
+- How should this interact with `mem::forget`, leaked tasks, detached tasks, and process shutdown?
+
+## 8. Pin projection
 
 - What projection guarantees does `AsyncDrop` need for pinned fields?
 - Should the language provide special projection support during async destruction?
 - How should unsafe code reason about partially destroyed pinned values?
 - Can existing pin-projection library patterns migrate cleanly?
 
-## 8. Destruction order
+## 9. Destruction order
 
 - How exactly should field destruction order map from synchronous drop glue to async drop glue?
 - What happens when one field's async destructor awaits while other fields remain alive?
 - How should partially initialized values be async-destroyed after errors?
 - How should panic during synchronous fallback interact with async field destruction?
 
-## 9. Migration
+## 10. Migration
 
 - Which parts can be stabilized first without committing to async-only destructibility?
 - What lints would give useful signal without overwhelming existing code?
 - How should standard library types adopt async cleanup, if at all?
 - What edition changes would make the final model easier to teach?
 
-## 10. Minimal viable stabilization
+## 11. Minimal viable stabilization
 
 - What is the smallest stable feature that gives libraries real value?
 - Can `AsyncDrop` for synchronously droppable types stabilize before `!Destruct` or equivalent syntax?
